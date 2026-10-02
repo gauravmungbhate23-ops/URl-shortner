@@ -6,14 +6,17 @@
     <title>Signup</title>
 </head>
 <body>
-    <h1>SignUp</h1>
+    <h1>LOGIN</h1>
+    <% if (typeof error !== 'undefined' && error) { %>
+        <p style="color: red;"><%= error %></p>
+    <% } %>
     <form action="/user/login" method="post">
         <label>Email</label>
         <input type="text" required name="email"/>
         <label>Password</label>
         <input type="text" required name="password"/>
 
-        <button type="submit">Signup</button>
+        <button type="submit">LOGIN</button>
     </form>
 </body>
 </html>
