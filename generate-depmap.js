@@ -1,0 +1,699 @@
+#!/usr/bin/env node
+/**
+ * generate-depmap.js
+ * ──────────────────
+ * Scans the project for require() imports, res.render() view references,
+ * and package.json dependencies, then generates an interactive D3 force-graph
+ * and opens it in the default browser.
+ *
+ * Usage:  node generate-depmap.js
+ *     or: npm run depmap
+ */
+
+const fs = require("fs");
+const path = require("path");
+const { exec } = require("child_process");
+
+// ── Configuration ───────────────────────────────────
+const ROOT = __dirname;
+const IGNORE_DIRS = new Set(["node_modules", ".git", ".vscode", ".idea"]);
+const JS_EXTENSIONS = new Set([".js", ".mjs", ".cjs"]);
+const VIEW_EXTENSIONS = new Set([".ejs", ".pug", ".hbs", ".handlebars"]);
+const OUTPUT_FILE = path.join(ROOT, "dependency-map.html");
+
+// ── Layer classification ────────────────────────────
+function classifyFile(relPath) {
+  if (relPath === "index.js" || relPath === "app.js" || relPath === "server.js") return "entry";
+  if (relPath.startsWith("config") || relPath === "connection.js" || relPath === "db.js" || relPath === "database.js") return "config";
+  if (relPath.startsWith("middlewares") || relPath.startsWith("middleware")) return "middleware";
+  if (relPath.startsWith("routes") || relPath.startsWith("route")) return "route";
+  if (relPath.startsWith("controllers") || relPath.startsWith("controller")) return "controller";
+  if (relPath.startsWith("models") || relPath.startsWith("model")) return "model";
+  if (relPath.startsWith("service") || relPath.startsWith("services") || relPath.startsWith("utils") || relPath.startsWith("helpers") || relPath.startsWith("lib")) return "service";
+  if (VIEW_EXTENSIONS.has(path.extname(relPath))) return "view";
+  return "service"; // fallback for misc project files
+}
+
+// ── Collect all project files ───────────────────────
+function walkDir(dir, base = dir) {
+  const results = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (IGNORE_DIRS.has(entry.name)) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...walkDir(full, base));
+    } else {
+      const ext = path.extname(entry.name);
+      if (JS_EXTENSIONS.has(ext) || VIEW_EXTENSIONS.has(ext)) {
+        results.push(path.relative(base, full).replace(/\\/g, "/"));
+      }
+    }
+  }
+  return results;
+}
+
+// ── Parse require() and res.render() from a JS file ─
+function parseFile(filePath) {
+  const content = fs.readFileSync(path.join(ROOT, filePath), "utf-8");
+  const requires = [];
+  const renders = [];
+
+  // Match require("...") and require('...')
+  const reqRegex = /require\s*\(\s*["']([^"']+)["']\s*\)/g;
+  let m;
+  while ((m = reqRegex.exec(content)) !== null) {
+    requires.push(m[1]);
+  }
+
+  // Match res.render("...") and return res.render("...")
+  const renderRegex = /\.render\s*\(\s*["']([^"']+)["']/g;
+  while ((m = renderRegex.exec(content)) !== null) {
+    renders.push(m[1]);
+  }
+
+  return { requires, renders };
+}
+
+// ── Resolve a require path to a project-relative path ─
+function resolveRequire(fromFile, reqPath) {
+  // If it starts with . or /, it's a local file
+  if (reqPath.startsWith(".") || reqPath.startsWith("/")) {
+    const fromDir = path.dirname(fromFile);
+    let resolved = path.posix.join(fromDir, reqPath);
+    // Try exact match, then with extensions
+    const tryPaths = [resolved];
+    JS_EXTENSIONS.forEach(ext => tryPaths.push(resolved + ext));
+    tryPaths.push(resolved + "/index.js");
+
+    for (const tryPath of tryPaths) {
+      if (fs.existsSync(path.join(ROOT, tryPath))) {
+        return tryPath;
+      }
+    }
+    // Return best guess even if not found
+    return resolved.endsWith(".js") ? resolved : resolved + ".js";
+  }
+  // It's an npm package (or builtin)
+  return null;
+}
+
+// ── Resolve a render() view name to a view file ─────
+function resolveView(viewName, viewFiles) {
+  for (const vf of viewFiles) {
+    const base = path.basename(vf, path.extname(vf));
+    if (base === viewName) return vf;
+  }
+  return null;
+}
+
+// ── MAIN ────────────────────────────────────────────
+function main() {
+  console.log("🔍 Scanning project files...");
+  const allFiles = walkDir(ROOT);
+  const jsFiles = allFiles.filter(f => JS_EXTENSIONS.has(path.extname(f)));
+  const viewFiles = allFiles.filter(f => VIEW_EXTENSIONS.has(path.extname(f)));
+
+  // Read package.json
+  let npmDeps = {};
+  const pkgPath = path.join(ROOT, "package.json");
+  if (fs.existsSync(pkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+    npmDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  }
+
+  // Built-in Node modules we care about
+  const BUILTINS = new Set([
+    "path", "fs", "http", "https", "url", "crypto", "os", "util",
+    "stream", "events", "child_process", "cluster", "net", "tls",
+    "dns", "readline", "zlib", "querystring", "assert", "buffer"
+  ]);
+
+  // ── Build nodes & links ──────────────────────────
+  const nodesMap = new Map();
+  const linksSet = new Set();
+
+  // Add project JS files
+  jsFiles.forEach(f => {
+    nodesMap.set(f, { id: f, layer: classifyFile(f), desc: "" });
+  });
+
+  // Add view files
+  viewFiles.forEach(f => {
+    nodesMap.set(f, { id: f, layer: "view", desc: `${path.extname(f).slice(1).toUpperCase()} template` });
+  });
+
+  // Parse each JS file
+  jsFiles.forEach(file => {
+    const { requires, renders } = parseFile(file);
+
+    requires.forEach(req => {
+      const resolved = resolveRequire(file, req);
+      if (resolved) {
+        // Local file
+        if (!nodesMap.has(resolved)) {
+          nodesMap.set(resolved, { id: resolved, layer: classifyFile(resolved), desc: "" });
+        }
+        linksSet.add(JSON.stringify({ source: file, target: resolved, type: "local" }));
+      } else {
+        // NPM or builtin
+        const pkgName = req.startsWith("@") ? req.split("/").slice(0, 2).join("/") : req.split("/")[0];
+        const isBuiltin = BUILTINS.has(pkgName);
+        const nodeId = isBuiltin ? `${pkgName} (builtin)` : pkgName;
+        if (!nodesMap.has(nodeId)) {
+          nodesMap.set(nodeId, {
+            id: nodeId,
+            layer: "npm",
+            desc: isBuiltin
+              ? `Node.js built-in module`
+              : `npm package${npmDeps[pkgName] ? " v" + npmDeps[pkgName] : ""}`
+          });
+        }
+        linksSet.add(JSON.stringify({ source: file, target: nodeId, type: "npm" }));
+      }
+    });
+
+    renders.forEach(viewName => {
+      const viewFile = resolveView(viewName, viewFiles);
+      if (viewFile) {
+        linksSet.add(JSON.stringify({ source: file, target: viewFile, type: "view" }));
+      }
+    });
+  });
+
+  // Add npm packages that exist in package.json but weren't directly required
+  Object.keys(npmDeps).forEach(pkg => {
+    if (!nodesMap.has(pkg)) {
+      nodesMap.set(pkg, { id: pkg, layer: "npm", desc: `npm package v${npmDeps[pkg]} (unused?)` });
+    }
+  });
+
+  const nodes = Array.from(nodesMap.values());
+  const links = Array.from(linksSet).map(s => JSON.parse(s));
+
+  // Generate descriptions for project files
+  nodes.forEach(n => {
+    if (n.layer !== "npm" && n.layer !== "view" && !n.desc) {
+      const incoming = links.filter(l => l.target === n.id).length;
+      const outgoing = links.filter(l => l.source === n.id).length;
+      n.desc = `${n.layer.charAt(0).toUpperCase() + n.layer.slice(1)} · ${outgoing} dependencies · used by ${incoming} file${incoming !== 1 ? "s" : ""}`;
+    }
+  });
+
+  console.log(`📊 Found ${nodes.length} nodes and ${links.length} edges`);
+  console.log(`   📁 ${jsFiles.length} JS files, ${viewFiles.length} view templates`);
+  console.log(`   📦 ${Object.keys(npmDeps).length} npm packages`);
+
+  // ── Generate HTML ────────────────────────────────
+  const html = buildHtml(nodes, links);
+  fs.writeFileSync(OUTPUT_FILE, html, "utf-8");
+  console.log(`✅ Dependency map written to ${OUTPUT_FILE}`);
+
+  // Open in default browser
+  const opener =
+    process.platform === "win32" ? "start" :
+    process.platform === "darwin" ? "open" : "xdg-open";
+  exec(`${opener} "${OUTPUT_FILE}"`);
+}
+
+// ── HTML Template ───────────────────────────────────
+function buildHtml(nodes, links) {
+  const nodesJson = JSON.stringify(nodes);
+  const linksJson = JSON.stringify(links);
+  const timestamp = new Date().toLocaleString();
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shawty URL — Interactive Dependency Map</title>
+  <meta name="description" content="Auto-generated interactive dependency graph for the Shawty URL Shortener project." />
+  <script src="https://d3js.org/d3.v7.min.js"><\/script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: #0a0e1a;
+      color: #e2e8f0;
+      display: flex;
+    }
+
+    /* ── Sidebar ─────────────────────────────── */
+    #sidebar {
+      width: 300px; min-width: 300px;
+      background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+      border-right: 1px solid rgba(99, 102, 241, .18);
+      display: flex; flex-direction: column;
+      z-index: 10; overflow: hidden;
+    }
+    #sidebar-header {
+      padding: 24px 20px 16px;
+      border-bottom: 1px solid rgba(99, 102, 241, .12);
+    }
+    #sidebar-header h1 {
+      font-size: 18px; font-weight: 700;
+      background: linear-gradient(135deg, #818cf8, #c084fc, #f472b6);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      letter-spacing: -.3px;
+    }
+    #sidebar-header p { font-size: 12px; color: #64748b; margin-top: 4px; }
+    #sidebar-header .timestamp { font-size: 10px; color: #475569; margin-top: 6px; }
+
+    #search-wrap { padding: 12px 20px; }
+    #search {
+      width: 100%; padding: 10px 14px; border-radius: 10px;
+      border: 1px solid rgba(99, 102, 241, .2);
+      background: rgba(15, 23, 42, .6); color: #e2e8f0;
+      font-size: 13px; font-family: inherit; outline: none;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    #search::placeholder { color: #475569; }
+    #search:focus { border-color: #818cf8; box-shadow: 0 0 0 3px rgba(129,140,248,.15); }
+
+    #filters { padding: 4px 20px 12px; display: flex; flex-wrap: wrap; gap: 6px; }
+    .filter-btn {
+      padding: 5px 12px; font-size: 11px; font-weight: 600; font-family: inherit;
+      border: 1px solid rgba(255,255,255,.08); border-radius: 20px;
+      background: rgba(255,255,255,.04); color: #94a3b8;
+      cursor: pointer; transition: all .2s;
+      text-transform: uppercase; letter-spacing: .5px;
+    }
+    .filter-btn:hover { background: rgba(255,255,255,.08); color: #e2e8f0; }
+    .filter-btn.active {
+      background: var(--filter-color, #818cf8); color: #fff;
+      border-color: transparent;
+      box-shadow: 0 0 12px var(--filter-glow, rgba(129,140,248,.35));
+    }
+
+    #file-list { flex: 1; overflow-y: auto; padding: 8px 12px; }
+    #file-list::-webkit-scrollbar { width: 5px; }
+    #file-list::-webkit-scrollbar-track { background: transparent; }
+    #file-list::-webkit-scrollbar-thumb { background: rgba(99,102,241,.25); border-radius: 10px; }
+
+    .file-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; border-radius: 10px; cursor: pointer;
+      transition: background .18s, transform .18s; margin-bottom: 2px;
+    }
+    .file-item:hover { background: rgba(99,102,241,.08); transform: translateX(2px); }
+    .file-item.highlighted { background: rgba(99,102,241,.14); }
+    .file-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .file-name {
+      font-size: 13px; font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .file-layer {
+      margin-left: auto; font-size: 10px; color: #475569;
+      text-transform: uppercase; letter-spacing: .4px; flex-shrink: 0;
+    }
+
+    #detail-pane {
+      padding: 16px 20px; border-top: 1px solid rgba(99,102,241,.12);
+      min-height: 160px; max-height: 240px; overflow-y: auto;
+      transition: opacity .3s;
+    }
+    #detail-pane.empty { opacity: .35; }
+    #detail-pane h3 { font-size: 13px; font-weight: 700; color: #818cf8; margin-bottom: 8px; }
+    #detail-pane .detail-section { margin-bottom: 10px; }
+    #detail-pane .detail-label {
+      font-size: 10px; text-transform: uppercase;
+      letter-spacing: .6px; color: #64748b; margin-bottom: 4px;
+    }
+    #detail-pane .detail-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+    .detail-tag {
+      padding: 3px 9px; font-size: 11px; border-radius: 6px;
+      background: rgba(99,102,241,.1); color: #a5b4fc;
+      cursor: pointer; transition: background .15s;
+    }
+    .detail-tag:hover { background: rgba(99,102,241,.2); }
+    .detail-tag.npm { background: rgba(239,68,68,.1); color: #fca5a5; }
+
+    /* ── Canvas ───────────────────────────────── */
+    #graph-container { flex: 1; position: relative; overflow: hidden; }
+    svg { display: block; width: 100%; height: 100%; }
+
+    #tooltip {
+      position: absolute; pointer-events: none; padding: 10px 14px;
+      border-radius: 10px; background: rgba(15, 23, 42, .92);
+      backdrop-filter: blur(12px); border: 1px solid rgba(129, 140, 248, .25);
+      font-size: 12px; color: #e2e8f0; white-space: nowrap;
+      opacity: 0; transform: translateY(4px);
+      transition: opacity .15s, transform .15s; z-index: 99;
+    }
+    #tooltip.show { opacity: 1; transform: translateY(0); }
+    #tooltip .tt-title { font-weight: 700; margin-bottom: 2px; }
+    #tooltip .tt-layer { font-size: 10px; color: #818cf8; text-transform: uppercase; letter-spacing: .5px; }
+
+    #legend {
+      position: absolute; bottom: 20px; right: 20px;
+      background: rgba(15, 23, 42, .85); backdrop-filter: blur(12px);
+      border: 1px solid rgba(99, 102, 241, .15); border-radius: 14px;
+      padding: 16px 20px; font-size: 12px; z-index: 5;
+    }
+    #legend h4 {
+      font-weight: 700; margin-bottom: 10px; color: #818cf8;
+      font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+    }
+    .legend-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .legend-swatch { width: 12px; height: 12px; border-radius: 50%; }
+    .legend-line { width: 22px; height: 2px; border-radius: 1px; }
+
+    #controls-hint {
+      position: absolute; top: 16px; right: 20px; font-size: 11px;
+      color: #475569; background: rgba(15, 23, 42, .7);
+      padding: 8px 14px; border-radius: 8px;
+      border: 1px solid rgba(99,102,241,.1); z-index: 5;
+    }
+    kbd {
+      padding: 1px 5px; border-radius: 4px;
+      background: rgba(99,102,241,.12); border: 1px solid rgba(99,102,241,.2);
+      font-family: inherit; font-size: 10px; color: #a5b4fc;
+    }
+
+    #stats {
+      position: absolute; top: 16px; left: 16px;
+      display: flex; gap: 12px; z-index: 5;
+    }
+    .stat-pill {
+      padding: 6px 14px; border-radius: 20px;
+      background: rgba(15, 23, 42, .8);
+      border: 1px solid rgba(99,102,241,.12);
+      font-size: 12px; color: #94a3b8;
+    }
+    .stat-pill strong { color: #e2e8f0; font-weight: 700; }
+
+    @keyframes pulse-ring {
+      0% { r: 0; opacity: .6; }
+      100% { r: 36; opacity: 0; }
+    }
+    .pulse-ring { animation: pulse-ring 2s ease-out infinite; }
+  </style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div id="sidebar-header">
+    <h1>⚡ Shawty URL</h1>
+    <p>Interactive Dependency Map</p>
+    <div class="timestamp">Generated: ${timestamp}</div>
+  </div>
+  <div id="search-wrap">
+    <input type="text" id="search" placeholder="Search files & packages…" />
+  </div>
+  <div id="filters"></div>
+  <div id="file-list"></div>
+  <div id="detail-pane" class="empty">
+    <p style="font-size:12px;color:#475569;">Click a node to see details</p>
+  </div>
+</aside>
+
+<div id="graph-container">
+  <div id="stats"></div>
+  <div id="controls-hint">
+    <kbd>Scroll</kbd> Zoom &nbsp; <kbd>Drag</kbd> Pan &nbsp; <kbd>Click</kbd> Inspect &nbsp; <kbd>Esc</kbd> Reset
+  </div>
+  <svg id="graph"></svg>
+  <div id="tooltip"></div>
+  <div id="legend"></div>
+</div>
+
+<script>
+const LAYERS = {
+  entry:      { label: "Entry",      color: "#f472b6", glow: "rgba(244,114,182,.4)" },
+  config:     { label: "Config",     color: "#facc15", glow: "rgba(250,204,21,.35)" },
+  middleware: { label: "Middleware",  color: "#38bdf8", glow: "rgba(56,189,248,.35)" },
+  route:      { label: "Route",      color: "#34d399", glow: "rgba(52,211,153,.35)" },
+  controller: { label: "Controller", color: "#818cf8", glow: "rgba(129,140,248,.4)" },
+  model:      { label: "Model",      color: "#fb923c", glow: "rgba(251,146,60,.35)" },
+  service:    { label: "Service",    color: "#c084fc", glow: "rgba(192,132,252,.4)" },
+  view:       { label: "View",       color: "#2dd4bf", glow: "rgba(45,212,191,.35)" },
+  npm:        { label: "NPM",        color: "#ef4444", glow: "rgba(239,68,68,.3)" },
+};
+
+const nodes = ${nodesJson};
+const links = ${linksJson};
+
+// ── Stats ────────────────────────────────────
+const statsEl = document.getElementById("stats");
+const projectFiles = nodes.filter(n => n.layer !== "npm").length;
+const npmPkgs = nodes.filter(n => n.layer === "npm").length;
+statsEl.innerHTML =
+  '<div class="stat-pill"><strong>' + nodes.length + '</strong>&nbsp;nodes</div>' +
+  '<div class="stat-pill"><strong>' + links.length + '</strong>&nbsp;edges</div>' +
+  '<div class="stat-pill"><strong>' + projectFiles + '</strong>&nbsp;files</div>' +
+  '<div class="stat-pill"><strong>' + npmPkgs + '</strong>&nbsp;packages</div>';
+
+// ── Filters ──────────────────────────────────
+const filtersEl = document.getElementById("filters");
+const presentLayers = new Set(nodes.map(n => n.layer));
+const activeFilters = new Set(presentLayers);
+Object.entries(LAYERS).forEach(function([key, val]) {
+  if (!presentLayers.has(key)) return;
+  var btn = document.createElement("button");
+  btn.className = "filter-btn active";
+  btn.textContent = val.label;
+  btn.style.setProperty("--filter-color", val.color);
+  btn.style.setProperty("--filter-glow", val.glow);
+  btn.dataset.layer = key;
+  btn.addEventListener("click", function() {
+    if (activeFilters.has(key)) { activeFilters.delete(key); btn.classList.remove("active"); }
+    else { activeFilters.add(key); btn.classList.add("active"); }
+    updateVisibility();
+  });
+  filtersEl.appendChild(btn);
+});
+
+// ── File list ────────────────────────────────
+var fileListEl = document.getElementById("file-list");
+function renderFileList(filter) {
+  filter = filter || "";
+  fileListEl.innerHTML = "";
+  var lower = filter.toLowerCase();
+  nodes
+    .filter(function(n) { return !filter || n.id.toLowerCase().indexOf(lower) >= 0; })
+    .sort(function(a, b) { return a.layer.localeCompare(b.layer) || a.id.localeCompare(b.id); })
+    .forEach(function(n) {
+      var item = document.createElement("div");
+      item.className = "file-item";
+      item.dataset.nodeId = n.id;
+      item.innerHTML =
+        '<span class="file-dot" style="background:' + LAYERS[n.layer].color + '"></span>' +
+        '<span class="file-name">' + n.id + '</span>' +
+        '<span class="file-layer">' + LAYERS[n.layer].label + '</span>';
+      item.addEventListener("click", function() { highlightNode(n.id); });
+      fileListEl.appendChild(item);
+    });
+}
+renderFileList();
+document.getElementById("search").addEventListener("input", function(e) { renderFileList(e.target.value); });
+
+// ── Legend ────────────────────────────────────
+var legendEl = document.getElementById("legend");
+var legendHtml = "<h4>Layers</h4>";
+Object.entries(LAYERS).forEach(function([k,v]) {
+  if (!presentLayers.has(k)) return;
+  legendHtml += '<div class="legend-row"><span class="legend-swatch" style="background:' + v.color + '"></span><span>' + v.label + '</span></div>';
+});
+legendHtml += '<h4 style="margin-top:12px">Edges</h4>';
+legendHtml += '<div class="legend-row"><span class="legend-line" style="background:#818cf8"></span><span>Local import</span></div>';
+legendHtml += '<div class="legend-row"><span class="legend-line" style="background:#ef4444"></span><span>NPM require</span></div>';
+legendHtml += '<div class="legend-row"><span class="legend-line" style="background:#2dd4bf;opacity:.6"></span><span>View render</span></div>';
+legendEl.innerHTML = legendHtml;
+
+// ── D3 Graph ─────────────────────────────────
+var svg = d3.select("#graph");
+var container = document.getElementById("graph-container");
+var width = container.clientWidth;
+var height = container.clientHeight;
+
+var defs = svg.append("defs");
+var glowFilter = defs.append("filter").attr("id","glow").attr("x","-50%").attr("y","-50%").attr("width","200%").attr("height","200%");
+glowFilter.append("feGaussianBlur").attr("stdDeviation","4").attr("result","blur");
+glowFilter.append("feMerge").selectAll("feMergeNode").data(["blur","SourceGraphic"]).join("feMergeNode").attr("in",function(d){return d;});
+
+["local","npm","view"].forEach(function(type) {
+  var color = type==="npm"?"#ef4444":type==="view"?"#2dd4bf":"#818cf8";
+  defs.append("marker").attr("id","arrow-"+type)
+    .attr("viewBox","0 -5 10 10").attr("refX",28).attr("refY",0)
+    .attr("markerWidth",6).attr("markerHeight",6).attr("orient","auto")
+    .append("path").attr("d","M0,-5L10,0L0,5").attr("fill",color).attr("opacity",0.7);
+});
+
+var g = svg.append("g");
+var zoom = d3.zoom().scaleExtent([0.2,4]).on("zoom",function(e){g.attr("transform",e.transform);});
+svg.call(zoom);
+
+var linkG = g.append("g").attr("class","links");
+var linkElements = linkG.selectAll("line").data(links).join("line")
+  .attr("stroke",function(d){return d.type==="npm"?"#ef4444":d.type==="view"?"#2dd4bf":"#818cf8";})
+  .attr("stroke-opacity",function(d){return d.type==="view"?0.3:0.2;})
+  .attr("stroke-width",1.5)
+  .attr("stroke-dasharray",function(d){return d.type==="view"?"4,3":null;})
+  .attr("marker-end",function(d){return "url(#arrow-"+d.type+")";});
+
+function nodeRadius(d) {
+  if (d.layer==="entry") return 22;
+  if (d.layer==="npm") return 14;
+  return 17;
+}
+
+var nodeG = g.append("g").attr("class","nodes");
+var nodeGroups = nodeG.selectAll("g").data(nodes).join("g")
+  .attr("cursor","pointer")
+  .call(d3.drag().on("start",dragStarted).on("drag",dragged).on("end",dragEnded));
+
+nodeGroups.filter(function(d){return d.layer==="entry";}).append("circle")
+  .attr("r",0).attr("fill","none")
+  .attr("stroke",function(d){return LAYERS[d.layer].color;})
+  .attr("stroke-opacity",0.3).attr("stroke-width",1.5).attr("class","pulse-ring");
+
+nodeGroups.append("circle")
+  .attr("r",function(d){return nodeRadius(d)+6;})
+  .attr("fill",function(d){return LAYERS[d.layer].color;})
+  .attr("opacity",0.08).attr("class","ambient-glow");
+
+nodeGroups.append("circle")
+  .attr("r",function(d){return nodeRadius(d);})
+  .attr("fill",function(d){
+    var c=d3.color(LAYERS[d.layer].color);
+    return "rgba("+c.r+","+c.g+","+c.b+",0.15)";
+  })
+  .attr("stroke",function(d){return LAYERS[d.layer].color;})
+  .attr("stroke-width",2).attr("class","main-circle").attr("filter","url(#glow)");
+
+var icons = { entry:"⚡",config:"⚙",middleware:"🛡",route:"🔀",controller:"🎮",model:"📦",service:"🔧",view:"📄",npm:"📥" };
+nodeGroups.append("text")
+  .attr("text-anchor","middle").attr("dominant-baseline","central")
+  .attr("font-size",function(d){return d.layer==="npm"?"10px":"12px";})
+  .attr("fill",function(d){return LAYERS[d.layer].color;})
+  .attr("pointer-events","none")
+  .text(function(d){return icons[d.layer]||"•";});
+
+nodeGroups.append("text")
+  .attr("text-anchor","middle")
+  .attr("dy",function(d){return nodeRadius(d)+16;})
+  .attr("font-size","11px").attr("font-weight",500).attr("fill","#94a3b8")
+  .attr("pointer-events","none").attr("class","node-label")
+  .text(function(d){ var p=d.id.split("/"); return p[p.length-1]; });
+
+var tooltip = document.getElementById("tooltip");
+nodeGroups
+  .on("mouseenter",function(e,d){
+    tooltip.innerHTML='<div class="tt-title">'+d.id+'</div><div class="tt-layer">'+LAYERS[d.layer].label+'</div>';
+    tooltip.classList.add("show");
+  })
+  .on("mousemove",function(e){
+    var rect=container.getBoundingClientRect();
+    tooltip.style.left=(e.clientX-rect.left+14)+"px";
+    tooltip.style.top=(e.clientY-rect.top-10)+"px";
+  })
+  .on("mouseleave",function(){tooltip.classList.remove("show");})
+  .on("click",function(e,d){e.stopPropagation();highlightNode(d.id);});
+svg.on("click",resetHighlight);
+
+var simulation = d3.forceSimulation(nodes)
+  .force("link",d3.forceLink(links).id(function(d){return d.id;}).distance(120).strength(0.6))
+  .force("charge",d3.forceManyBody().strength(-420))
+  .force("center",d3.forceCenter(width/2,height/2))
+  .force("collision",d3.forceCollide().radius(function(d){return nodeRadius(d)+20;}))
+  .force("x",d3.forceX(width/2).strength(0.04))
+  .force("y",d3.forceY(height/2).strength(0.04))
+  .on("tick",ticked);
+
+function ticked(){
+  linkElements.attr("x1",function(d){return d.source.x;}).attr("y1",function(d){return d.source.y;})
+    .attr("x2",function(d){return d.target.x;}).attr("y2",function(d){return d.target.y;});
+  nodeGroups.attr("transform",function(d){return "translate("+d.x+","+d.y+")";});
+}
+function dragStarted(event,d){if(!event.active)simulation.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;}
+function dragged(event,d){d.fx=event.x;d.fy=event.y;}
+function dragEnded(event,d){if(!event.active)simulation.alphaTarget(0);d.fx=null;d.fy=null;}
+
+function highlightNode(id){
+  var connected=new Set();connected.add(id);
+  links.forEach(function(l){
+    var sid=typeof l.source==="object"?l.source.id:l.source;
+    var tid=typeof l.target==="object"?l.target.id:l.target;
+    if(sid===id)connected.add(tid);if(tid===id)connected.add(sid);
+  });
+  nodeGroups.select(".main-circle")
+    .attr("stroke-opacity",function(d){return connected.has(d.id)?1:0.15;})
+    .attr("fill-opacity",function(d){return connected.has(d.id)?1:0.3;});
+  nodeGroups.select(".node-label")
+    .attr("fill-opacity",function(d){return connected.has(d.id)?1:0.2;});
+  nodeGroups.select(".ambient-glow")
+    .attr("opacity",function(d){return connected.has(d.id)?0.15:0.02;});
+  linkElements
+    .attr("stroke-opacity",function(d){
+      var sid=typeof d.source==="object"?d.source.id:d.source;
+      var tid=typeof d.target==="object"?d.target.id:d.target;
+      return(sid===id||tid===id)?0.7:0.04;
+    })
+    .attr("stroke-width",function(d){
+      var sid=typeof d.source==="object"?d.source.id:d.source;
+      var tid=typeof d.target==="object"?d.target.id:d.target;
+      return(sid===id||tid===id)?2.5:1;
+    });
+  document.querySelectorAll(".file-item").forEach(function(el){
+    el.classList.toggle("highlighted",el.dataset.nodeId===id);
+  });
+  var node=nodes.find(function(n){return n.id===id;});
+  var deps=links.filter(function(l){return(typeof l.source==="object"?l.source.id:l.source)===id;});
+  var usedBy=links.filter(function(l){return(typeof l.target==="object"?l.target.id:l.target)===id;});
+  var pane=document.getElementById("detail-pane");
+  pane.classList.remove("empty");
+  var html='<h3>'+node.id+'</h3><p style="font-size:12px;color:#94a3b8;margin-bottom:10px">'+node.desc+'</p>';
+  if(deps.length){
+    html+='<div class="detail-section"><div class="detail-label">Depends on ('+deps.length+')</div><div class="detail-tags">';
+    deps.forEach(function(d){
+      var tid=typeof d.target==="object"?d.target.id:d.target;
+      var tn=nodes.find(function(n){return n.id===tid;});
+      html+='<span class="detail-tag '+(tn&&tn.layer==="npm"?"npm":"")+'" onclick="highlightNode(\\''+tid.replace(/'/g,"\\\\'")+'\\')">'+tid+'</span>';
+    });
+    html+='</div></div>';
+  }
+  if(usedBy.length){
+    html+='<div class="detail-section"><div class="detail-label">Used by ('+usedBy.length+')</div><div class="detail-tags">';
+    usedBy.forEach(function(d){
+      var sid=typeof d.source==="object"?d.source.id:d.source;
+      html+='<span class="detail-tag" onclick="highlightNode(\\''+sid.replace(/'/g,"\\\\'")+'\\')">'+sid+'</span>';
+    });
+    html+='</div></div>';
+  }
+  pane.innerHTML=html;
+}
+
+function resetHighlight(){
+  nodeGroups.select(".main-circle").attr("stroke-opacity",1).attr("fill-opacity",1);
+  nodeGroups.select(".node-label").attr("fill-opacity",1);
+  nodeGroups.select(".ambient-glow").attr("opacity",0.08);
+  linkElements.attr("stroke-opacity",function(d){return d.type==="view"?0.3:0.2;}).attr("stroke-width",1.5);
+  document.querySelectorAll(".file-item").forEach(function(el){el.classList.remove("highlighted");});
+  var pane=document.getElementById("detail-pane");
+  pane.classList.add("empty");
+  pane.innerHTML='<p style="font-size:12px;color:#475569;">Click a node to see details</p>';
+}
+
+function updateVisibility(){
+  nodeGroups.attr("display",function(d){return activeFilters.has(d.layer)?null:"none";});
+  linkElements.attr("display",function(d){
+    var s=typeof d.source==="object"?d.source:nodes.find(function(n){return n.id===d.source;});
+    var t=typeof d.target==="object"?d.target:nodes.find(function(n){return n.id===d.target;});
+    return(s&&activeFilters.has(s.layer)&&t&&activeFilters.has(t.layer))?null:"none";
+  });
+  renderFileList(document.getElementById("search").value);
+}
+
+document.addEventListener("keydown",function(e){if(e.key==="Escape")resetHighlight();});
+window.addEventListener("resize",function(){
+  simulation.force("center",d3.forceCenter(container.clientWidth/2,container.clientHeight/2));
+  simulation.alpha(0.3).restart();
+});
+<\/script>
+</body>
+</html>`;
+}
+
+main();
