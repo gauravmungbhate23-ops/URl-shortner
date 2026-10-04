@@ -25,7 +25,7 @@ app.use(cookieParser());
             
 app.use("/url" , restrictToLoggedinUserOnly , urlRoute);
 app.use("/user",userRoute);
-app.use("/",checkAuth ,staticRoute);
+app.use("/",staticRoute);
 
 app.get("/test",async(req , res)=>{
     const allUrls = await URL.find({});

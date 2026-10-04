@@ -14,9 +14,13 @@ async function restrictToLoggedinUserOnly(req , res , next){
 }
 
 async function checkAuth(req , res , next){
-     const userId = req.cookies.uid;
+    const token = req.cookies.uid;
 
-    const user = getUser(userId);
+    if (!token) {
+        return res.redirect("/login");
+    }
+
+    const user = getUser(token);
 
     req.user = user ;
     next();

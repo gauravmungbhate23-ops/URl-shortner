@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Signup</title>
+    <title>LOGIN</title>
 </head>
 <body>
     <h1>LOGIN</h1>
     <% if (typeof error !== 'undefined' && error) { %>
         <p style="color: red;"><%= error %></p>
     <% } %>
-    <form action="/user/login" method="post">
+    <form action="/user/login" method="POST">
         <label>Email</label>
         <input type="text" required name="email"/>
         <label>Password</label>
